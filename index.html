@@ -2,85 +2,190 @@
 <html lang="en">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ShinLogger BLE test</title>
-
+<title>ShinLogger</title>
+<style>
+:root{font:16px system-ui;color:#14252b;background:#f1f6f5}
+body{max-width:750px;margin:auto;padding:1rem}
+section{background:white;padding:1rem;border:1px solid #d4e2df;border-radius:12px;margin:1rem 0}
+button{font:inherit;min-height:44px;padding:.5rem .8rem;margin:.2rem;border:1px solid #8aa5a1;border-radius:7px;background:white;color:inherit}
+button:enabled:hover{background:#dfeeea} button:disabled{opacity:.5}
+canvas{display:block;width:100%;height:155px}
+h1,h2{margin:.2rem 0 .5rem} h2{font-size:1rem}
+#status,#error{ min-height:1.25em; overflow-wrap:anywhere }
+#error{color:#a23727} .legend{font-size:.9rem}
+</style>
 <h1>ShinLogger</h1>
+<section aria-label="Device controls">
 <button id="connect">Connect</button>
-<button data-command="r" disabled>Read once</button>
-<button data-command="s" disabled>Start live</button>
-<button data-command="p" disabled>Pause live</button>
+<button data-command="START" disabled>Start recording</button>
+<button data-command="STOP" disabled>Stop recording</button>
+<button data-command="STATUS" disabled>Check status</button>
 <p id="status" role="status">Disconnected</p>
-<pre id="output"></pre>
-
+<p id="clock">Clock sync pending</p>
+<p id="error" role="alert"></p>
+</section>
+<section aria-label="Sensor traces">
+<h2 id="view">Live preview · last 20 seconds</h2>
+<p class="legend"><span style="color:#176cba">X</span> · <span style="color:#047457">Y</span> · <span style="color:#ac4b17">Z</span></p>
+<h2>Acceleration (m/s²)</h2>
+<canvas id="acceleration" aria-label="Acceleration chart"></canvas>
+<h2>Angular velocity (rad/s)</h2>
+<canvas id="gyro" aria-label="Gyroscope chart"></canvas>
+</section>
 <script>
-const uartUuid = id => `6e40000${id}-b5a3-f393-e0a9-e50e24dcca9e`;
-const connect = document.querySelector("#connect");
-const status = document.querySelector("#status");
-const output = document.querySelector("#output");
-const commands = document.querySelectorAll("[data-command]");
+"use strict";
+const get = id => document.getElementById(id);
+const buttons = [...document.querySelectorAll("[data-command]")];
+const uuid = n => `6e40000${n}-b5a3-f393-e0a9-e50e24dcca9e`;
+const palette = ["#176cba", "#047457", "#ac4b17"];
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-let rx;
+let rx, pending = "", points = [], recording = null, busy = false;
+let connectedAt = 0;
 
-function setConnected(connected) {
-  connect.disabled = connected;
-  commands.forEach(button => { button.disabled = !connected; });
+function controls() {
+  buttons.forEach(button => {
+    const command = button.dataset.command;
+    button.disabled = !rx || busy ||
+      (command === "START" && recording !== false) ||
+      (command === "STOP" && recording === false);
+  });
 }
 
-connect.onclick = async () => {
-  let device;
-  connect.disabled = true;
-  try {
-    if (!navigator.bluetooth) {
-      throw new Error("Open this page over HTTPS in Android Chrome.");
+async function send(command) {
+  const bytes = encoder.encode(command + "\n");
+  if (rx.properties.write) await rx.writeValueWithResponse(bytes);
+  else await rx.writeValueWithoutResponse(bytes);
+}
+
+function receive(event) {
+  const bytes = new Uint8Array(event.target.value.buffer,
+    event.target.value.byteOffset, event.target.value.byteLength);
+  pending += String.fromCharCode(...bytes);
+  const lines = pending.split("\n");
+  pending = lines.pop();
+  for (const line of lines) {
+    const [type, ...fields] = line.trim().split(",");
+    if (type === "DATA") {
+      const values = fields.map(Number);
+      if (values.length === 6 && values.every(Number.isFinite)) {
+        points.push({time: (performance.now() - connectedAt) / 1000, values});
+      }
+    } else if (type === "CLOCK") {
+      get("clock").textContent = "Synced · " + new Date(Number(fields[0])).toLocaleString();
+    } else if (type === "STATE") {
+      recording = fields[0] === "RECORDING";
+      get("status").textContent = recording ? "Recording on XIAO" : fields[1]
+        ? `Saved ${fields[1]} · ${fields[2]} samples · ${fields[3]} missed loop slots`
+        : "Connected · ready";
+      controls();
+    } else if (type === "ERROR") {
+      get("error").textContent = fields.join(",");
     }
+  }
+}
 
-    device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [uartUuid(1)] }]
-    });
-
+get("connect").onclick = async () => {
+  let device;
+  const button = get("connect");
+  button.disabled = true;
+  get("error").textContent = "";
+  try {
+    if (!navigator.bluetooth) throw new Error("Open the HTTPS page in Android Chrome.");
+    device = await navigator.bluetooth.requestDevice({filters: [{services: [uuid(1)]}]});
     device.addEventListener("gattserverdisconnected", () => {
       rx = undefined;
-      setConnected(false);
-      status.textContent = "Disconnected";
-    }, { once: true });
-
+      recording = null;
+      button.disabled = false;
+      get("status").textContent = "Disconnected · check trial status after reconnecting";
+      get("clock").textContent = "Clock sync pending";
+      controls();
+    }, {once:true});
     const server = await device.gatt.connect();
-    const uart = await server.getPrimaryService(uartUuid(1));
-    rx = await uart.getCharacteristic(uartUuid(2));
-    const tx = await uart.getCharacteristic(uartUuid(3));
-
-    output.textContent = "";
-    tx.addEventListener("characteristicvaluechanged", event => {
-      const text = decoder.decode(event.target.value, { stream: true });
-      output.textContent = (output.textContent + text).slice(-3000);
-    });
+    const service = await server.getPrimaryService(uuid(1));
+    const write = await service.getCharacteristic(uuid(2));
+    const tx = await service.getCharacteristic(uuid(3));
+    pending = "";
+    points = [];
+    connectedAt = performance.now();
+    tx.addEventListener("characteristicvaluechanged", receive);
     await tx.startNotifications();
-
-    setConnected(true);
-    status.textContent = `Connected to ${device.name || "ShinLogger"}`;
+    rx = write;
+    get("status").textContent = "Connected · checking logger";
+    await send("T," + Date.now());
+    await send("STATUS");
+    await send("s");
+    controls();
   } catch (error) {
     if (device?.gatt.connected) device.gatt.disconnect();
     rx = undefined;
-    setConnected(false);
-    status.textContent = error.message;
+    button.disabled = false;
+    get("error").textContent = error.message;
+    controls();
   }
 };
 
-commands.forEach(button => {
-  button.onclick = async () => {
-    if (!rx) return;
-    try {
-      const data = encoder.encode(button.dataset.command);
-      if (rx.properties.write) {
-        await rx.writeValueWithResponse(data);
-      } else {
-        await rx.writeValueWithoutResponse(data);
-      }
-    } catch (error) {
-      status.textContent = error.message;
+for (const button of buttons) button.onclick = async () => {
+  busy = true;
+  controls();
+  get("error").textContent = "";
+  try {
+    await send(button.dataset.command);
+  } catch (error) {
+    get("error").textContent = error.message;
+  } finally {
+    busy = false;
+    controls();
+  }
+};
+
+function plot(canvas, axis, minRange, now) {
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  const scale = devicePixelRatio || 1;
+  if (canvas.width !== Math.round(width * scale) || canvas.height !== Math.round(height * scale)) {
+    canvas.width = Math.round(width * scale);
+    canvas.height = Math.round(height * scale);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  let range = minRange;
+  for (const point of points) for (let i = 0; i < 3; i++) {
+    range = Math.max(range, Math.abs(point.values[axis + i]));
+  }
+  const left = 36, bottom = height - 20, top = 10;
+  for (const value of [-range, 0, range]) {
+    const y = top + (1 - value / range) * (bottom - top) / 2;
+    ctx.fillStyle = "#52646a";
+    ctx.fillText(value.toFixed(1), 0, y + 3);
+    ctx.fillStyle = "#d4e2df";
+    ctx.fillRect(left, y, width - left, 1);
+  }
+  ctx.fillStyle = "#52646a";
+  ctx.fillText("−20 s", left, height - 5);
+  ctx.fillText("now", width - 22, height - 5);
+  for (let i = 0; i < 3; i++) {
+    ctx.strokeStyle = ctx.fillStyle = palette[i];
+    ctx.lineWidth = 1.5;
+    let previous = -Infinity;
+    ctx.beginPath();
+    for (const point of points) {
+      const x = left + (point.time - now + 20) * (width - left - 2) / 20;
+      const y = top + (1 - point.values[axis+i] / range) * (bottom - top) / 2;
+      if (point.time - previous > 0.65) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+      ctx.fillRect(x, y, 2, 2);
+      previous = point.time;
     }
-  };
-});
+    ctx.stroke();
+  }
+}
+
+setInterval(() => {
+  const now = (performance.now() - connectedAt) / 1000;
+  points = points.filter(point => point.time >= now - 20);
+  plot(get("acceleration"), 0, 10, now);
+  plot(get("gyro"), 3, 1, now);
+}, 100);
 </script>
 </html>
