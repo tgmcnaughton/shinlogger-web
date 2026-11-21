@@ -20,6 +20,8 @@ h1,h2{margin:.2rem 0 .5rem} h2{font-size:1rem}
 <button data-command="START" disabled>Start recording</button>
 <button data-command="STOP" disabled>Stop recording</button>
 <button data-command="STATUS" disabled>Check status</button>
+<button id="download" disabled>Download CSV</button>
+<p id="progress" role="status"></p>
 <p id="status" role="status">Disconnected</p>
 <p id="clock">Clock sync pending</p>
 <p id="error" role="alert"></p>
@@ -41,8 +43,12 @@ const palette = ["#176cba", "#047457", "#ac4b17"];
 const encoder = new TextEncoder();
 let rx, pending = "", points = [], recording = null, busy = false;
 let connectedAt = 0;
+let savedRows = 0;
+let waiting;
+const download = get("download");
 
 function controls() {
+  download.disabled = !rx || busy || recording !== false || !savedRows;
   buttons.forEach(button => {
     const command = button.dataset.command;
     button.disabled = !rx || busy ||
@@ -74,11 +80,15 @@ function receive(event) {
       get("clock").textContent = "Synced · " + new Date(Number(fields[0])).toLocaleString();
     } else if (type === "STATE") {
       recording = fields[0] === "RECORDING";
-      get("status").textContent = recording ? "Recording on XIAO" : fields[1]
-        ? `Saved ${fields[1]} · ${fields[2]} samples · ${fields[3]} missed loop slots`
+      savedRows = Number(fields[2]);
+      get("status").textContent = recording ? "Recording on XIAO" : Number(fields[1])
+        ? `${fields[4] === "full" ? "RAM full" : "Stopped"} · ${savedRows} samples in RAM · ${fields[3]} missed loop slots`
         : "Connected · ready";
       controls();
+    } else if (waiting && type === waiting.type) {
+      waiting.finish(null, fields);
     } else if (type === "ERROR") {
+      if (waiting) waiting.finish(new Error(fields.join(",")));
       get("error").textContent = fields.join(",");
     }
   }
@@ -93,6 +103,7 @@ get("connect").onclick = async () => {
     if (!navigator.bluetooth) throw new Error("Open the HTTPS page in Android Chrome.");
     device = await navigator.bluetooth.requestDevice({filters: [{services: [uuid(1)]}]});
     device.addEventListener("gattserverdisconnected", () => {
+      if (waiting) waiting.finish(new Error("Bluetooth disconnected"));
       rx = undefined;
       recording = null;
       button.disabled = false;
@@ -131,6 +142,70 @@ for (const button of buttons) button.onclick = async () => {
   try {
     await send(button.dataset.command);
   } catch (error) {
+    get("error").textContent = error.message;
+  } finally {
+    busy = false;
+    controls();
+  }
+};
+
+function request(command, type) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => finish(new Error("No reply from XIAO")), 5000);
+    function finish(error, fields) {
+      if (waiting?.finish !== finish) return;
+      clearTimeout(timeout);
+      waiting = undefined;
+      if (error) reject(error);
+      else resolve(fields);
+    }
+    waiting = {type, finish};
+    send(command).catch(finish);
+  });
+}
+
+download.onclick = async () => {
+  busy = true;
+  controls();
+  get("error").textContent = "";
+  get("progress").textContent = "Reading trial…";
+  try {
+    const [trial, count, utc] = (await request("INFO", "INFO")).map(Number);
+    if (!Number.isSafeInteger(trial) || !(count > 0 && count <= 1170) ||
+        !Number.isInteger(count) || !Number.isSafeInteger(utc)) {
+      throw new Error("Invalid trial metadata");
+    }
+    const rows = ["elapsed_ms,utc,ax_m_s2,ay_m_s2,az_m_s2,gx_rad_s,gy_rad_s,gz_rad_s"];
+    const rowSize = 28;
+    let offset = 0;
+    while (offset < count) {
+      const [id, start, hex] = await request(`GET,${trial},${offset}`, "ROWS");
+      const expected = Math.min(4, count - offset);
+      if (Number(id) !== trial || Number(start) !== offset ||
+          hex?.length !== expected * rowSize * 2 || /[^0-9a-f]/i.test(hex)) {
+        throw new Error("Incomplete or out-of-order data. Retry download.");
+      }
+      const bytes = Uint8Array.from(hex.match(/../g), byte => parseInt(byte, 16));
+      const view = new DataView(bytes.buffer);
+      for (let pos = 0; pos < bytes.length; pos += rowSize) {
+        const elapsed = view.getUint32(pos, true);
+        const timestamp = utc ? new Date(utc + elapsed).toISOString() : "";
+        const channels = Array.from({length: 6}, (_, i) => view.getFloat32(pos + 4 + i * 4, true));
+        rows.push([elapsed, timestamp, ...channels].join(","));
+      }
+      offset += expected;
+      get("progress").textContent = `Downloaded ${offset} of ${count} samples`;
+    }
+    const url = URL.createObjectURL(new Blob([rows.join("\n") + "\n"], {type:"text/csv"}));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `shinlogger-${utc || "unsynced"}-${trial}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (error) {
+    get("progress").textContent = "";
     get("error").textContent = error.message;
   } finally {
     busy = false;
