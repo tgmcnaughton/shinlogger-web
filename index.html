@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ShinLogger BLE test</title>
+
+<h1>ShinLogger</h1>
+<button id="connect">Connect</button>
+<button data-command="r" disabled>Read once</button>
+<button data-command="s" disabled>Start live</button>
+<button data-command="p" disabled>Pause live</button>
+<p id="status" role="status">Disconnected</p>
+<pre id="output"></pre>
+
+<script>
+const uartUuid = id => `6e40000${id}-b5a3-f393-e0a9-e50e24dcca9e`;
+const connect = document.querySelector("#connect");
+const status = document.querySelector("#status");
+const output = document.querySelector("#output");
+const commands = document.querySelectorAll("[data-command]");
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+let rx;
+
+function setConnected(connected) {
+  connect.disabled = connected;
+  commands.forEach(button => { button.disabled = !connected; });
+}
+
+connect.onclick = async () => {
+  let device;
+  connect.disabled = true;
+  try {
+    if (!navigator.bluetooth) {
+      throw new Error("Open this page over HTTPS in Android Chrome.");
+    }
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [uartUuid(1)] }]
+    });
+
+    device.addEventListener("gattserverdisconnected", () => {
+      rx = undefined;
+      setConnected(false);
+      status.textContent = "Disconnected";
+    }, { once: true });
+
+    const server = await device.gatt.connect();
+    const uart = await server.getPrimaryService(uartUuid(1));
+    rx = await uart.getCharacteristic(uartUuid(2));
+    const tx = await uart.getCharacteristic(uartUuid(3));
+
+    output.textContent = "";
+    tx.addEventListener("characteristicvaluechanged", event => {
+      const text = decoder.decode(event.target.value, { stream: true });
+      output.textContent = (output.textContent + text).slice(-3000);
+    });
+    await tx.startNotifications();
+
+    setConnected(true);
+    status.textContent = `Connected to ${device.name || "ShinLogger"}`;
+  } catch (error) {
+    if (device?.gatt.connected) device.gatt.disconnect();
+    rx = undefined;
+    setConnected(false);
+    status.textContent = error.message;
+  }
+};
+
+commands.forEach(button => {
+  button.onclick = async () => {
+    if (!rx) return;
+    try {
+      const data = encoder.encode(button.dataset.command);
+      if (rx.properties.write) {
+        await rx.writeValueWithResponse(data);
+      } else {
+        await rx.writeValueWithoutResponse(data);
+      }
+    } catch (error) {
+      status.textContent = error.message;
+    }
+  };
+});
+</script>
+</html>
